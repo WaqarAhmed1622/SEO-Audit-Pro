@@ -1,0 +1,215 @@
+name: Deploy to Production
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to deploy (e.g., v1.0.0)'
+        required: false
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_PREFIX: ${{ github.repository }}
+
+jobs:
+  # Run CI first
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  # Build production images
+  build:
+    name: Build Production Images
+    runs-on: ubuntu-latest
+    needs: ci
+    permissions:
+      contents: read
+      packages: write
+
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Determine version
+        id: version
+        run: |
+          if [ "${{ github.event.inputs.version }}" != "" ]; then
+            echo "version=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
+          elif [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            echo "version=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          else
+            echo "version=sha-$(echo ${{ github.sha }} | cut -c1-7)" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Build all images
+      - name: Build and push Backend
+        uses: docker/build-push-action@v5
+        with:
+          context: ./backend
+          file: ./deployment/docker/Dockerfile.backend
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/backend:${{ steps.version.outputs.version }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/backend:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build and push Frontend
+        uses: docker/build-push-action@v5
+        with:
+          context: ./frontend
+          file: ./deployment/docker/Dockerfile.frontend
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/frontend:${{ steps.version.outputs.version }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/frontend:latest
+          build-args: |
+            NEXT_PUBLIC_API_URL=${{ secrets.PROD_API_URL }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build and push SEO Engine
+        uses: docker/build-push-action@v5
+        with:
+          context: ./seo-engine
+          file: ./deployment/docker/Dockerfile.seo-engine
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/seo-engine:${{ steps.version.outputs.version }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/seo-engine:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build and push PDF Engine
+        uses: docker/build-push-action@v5
+        with:
+          context: ./pdf-engine
+          file: ./deployment/docker/Dockerfile.pdf-engine
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/pdf-engine:${{ steps.version.outputs.version }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/pdf-engine:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # Deploy with blue-green strategy
+  deploy:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: build
+    environment: production
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup SSH
+        uses: webfactory/ssh-agent@v0.8.0
+        with:
+          ssh-private-key: ${{ secrets.PROD_SSH_KEY }}
+
+      - name: Add host to known_hosts
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -H ${{ secrets.PROD_HOST }} >> ~/.ssh/known_hosts
+
+      - name: Run database migrations
+        run: |
+          ssh ${{ secrets.PROD_USER }}@${{ secrets.PROD_HOST }} << 'EOF'
+            cd /app
+            docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/backend:${{ needs.build.outputs.version }}
+            docker run --rm \
+              --network=host \
+              -e DATABASE_URL="${{ secrets.PROD_DATABASE_URL }}" \
+              ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/backend:${{ needs.build.outputs.version }} \
+              npx prisma migrate deploy
+          EOF
+
+      - name: Blue-Green Deployment
+        run: |
+          ssh ${{ secrets.PROD_USER }}@${{ secrets.PROD_HOST }} << 'EOF'
+            cd /app
+            
+            # Determine current and new deployment
+            CURRENT=$(docker ps --filter "name=app-blue" -q)
+            if [ -n "$CURRENT" ]; then
+              NEW_COLOR="green"
+              OLD_COLOR="blue"
+            else
+              NEW_COLOR="blue"
+              OLD_COLOR="green"
+            fi
+            
+            echo "Deploying to $NEW_COLOR..."
+            
+            # Pull new images
+            docker-compose -f docker-compose.prod.yml pull
+            
+            # Start new deployment
+            docker-compose -f docker-compose.prod.yml up -d --scale app-$NEW_COLOR=1
+            
+            # Wait for health check
+            sleep 30
+            
+            # Switch traffic (update nginx)
+            sed -i "s/app-$OLD_COLOR/app-$NEW_COLOR/g" /etc/nginx/sites-enabled/app.conf
+            nginx -t && nginx -s reload
+            
+            # Stop old deployment
+            docker-compose -f docker-compose.prod.yml stop app-$OLD_COLOR
+            
+            echo "Deployment complete!"
+          EOF
+
+      - name: Health check
+        run: |
+          for i in {1..10}; do
+            if curl -sf "${{ secrets.PROD_URL }}/health" > /dev/null; then
+              echo "✅ Production deployment healthy"
+              exit 0
+            fi
+            echo "Waiting for deployment... attempt $i"
+            sleep 10
+          done
+          echo "❌ Health check failed"
+          exit 1
+
+      - name: Rollback on failure
+        if: failure()
+        run: |
+          ssh ${{ secrets.PROD_USER }}@${{ secrets.PROD_HOST }} << 'EOF'
+            cd /app
+            # Rollback to previous version
+            docker-compose -f docker-compose.prod.yml up -d --scale app-blue=1 --scale app-green=0
+            echo "Rollback executed"
+          EOF
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v1
+        with:
+          generate_release_notes: true
+
+      - name: Notify team
+        if: always()
+        uses: 8398a7/action-slack@v3
+        with:
+          status: ${{ job.status }}
+          text: 'Production deployment ${{ job.status }} - Version: ${{ needs.build.outputs.version }}'
+          fields: repo,message,commit,author,ref,workflow
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        continue-on-error: true

@@ -1,0 +1,373 @@
+// Prisma Schema for SEO Audit SaaS Platform
+// Database: PostgreSQL
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ============================================
+// ENUMS
+// ============================================
+
+enum UserRole {
+  ADMIN
+  AGENCY
+  USER
+}
+
+enum Plan {
+  FREE
+  PRO
+  AGENCY
+  ENTERPRISE
+}
+
+enum AuditStatus {
+  PENDING
+  PROCESSING
+  COMPLETE
+  FAILED
+}
+
+enum OrgRole {
+  OWNER
+  ADMIN
+  MEMBER
+}
+
+enum InviteStatus {
+  PENDING
+  ACCEPTED
+  EXPIRED
+}
+
+// ============================================
+// USER & AUTHENTICATION
+// ============================================
+
+model User {
+  id                String    @id @default(uuid())
+  email             String    @unique
+  password          String?
+  name              String
+  avatar            String?
+  role              UserRole  @default(USER)
+  emailVerified     Boolean   @default(false)
+  googleId          String?   @unique
+  
+  // Relations
+  ownedOrgs         Organization[] @relation("OrgOwner")
+  orgMemberships    OrganizationMember[]
+  audits            Audit[]
+  
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+
+  @@index([email])
+}
+
+model EmailVerification {
+  id        String   @id @default(uuid())
+  email     String
+  token     String   @unique
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  @@index([token])
+  @@index([email])
+}
+
+model PasswordReset {
+  id        String   @id @default(uuid())
+  email     String
+  token     String   @unique
+  expiresAt DateTime
+  used      Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  @@index([token])
+  @@index([email])
+}
+
+// ============================================
+// ORGANIZATION (Multi-tenant)
+// ============================================
+
+model Organization {
+  id            String    @id @default(uuid())
+  name          String
+  slug          String    @unique
+  customDomain  String?   @unique
+  plan          Plan      @default(FREE)
+  
+  // Owner relation
+  ownerId       String
+  owner         User      @relation("OrgOwner", fields: [ownerId], references: [id])
+  
+  // Relations
+  members       OrganizationMember[]
+  branding      Branding?
+  audits        Audit[]
+  clients       Client[]
+  widgetConfigs WidgetConfig[]
+  subscription  Subscription?
+  
+  // Limits
+  auditLimit    Int       @default(1)
+  usedAudits    Int       @default(0)
+  
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  @@index([slug])
+  @@index([customDomain])
+}
+
+model OrganizationMember {
+  id        String   @id @default(uuid())
+  role      OrgRole  @default(MEMBER)
+  
+  orgId     String
+  org       Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  
+  createdAt DateTime @default(now())
+
+  @@unique([orgId, userId])
+  @@index([orgId])
+  @@index([userId])
+}
+
+model TeamInvite {
+  id        String       @id @default(uuid())
+  email     String
+  role      OrgRole      @default(MEMBER)
+  token     String       @unique
+  status    InviteStatus @default(PENDING)
+  
+  orgId     String
+  
+  expiresAt DateTime
+  createdAt DateTime     @default(now())
+
+  @@index([token])
+  @@index([email])
+}
+
+// ============================================
+// BRANDING (White-label)
+// ============================================
+
+model Branding {
+  id              String  @id @default(uuid())
+  logoUrl         String?
+  faviconUrl      String?
+  primaryColor    String  @default("#3B82F6")
+  secondaryColor  String  @default("#1E40AF")
+  accentColor     String  @default("#10B981")
+  companyName     String?
+  tagline         String?
+  
+  // PDF Template Settings
+  templateId      String  @default("default")
+  showSections    Json    @default("{}")
+  customCss       String?
+  footerText      String?
+  
+  orgId           String  @unique
+  org             Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+}
+
+// ============================================
+// AUDITS
+// ============================================
+
+model Audit {
+  id          String      @id @default(uuid())
+  url         String
+  score       Int?
+  status      AuditStatus @default(PENDING)
+  
+  // Results
+  jsonReport  Json?
+  pdfUrl      String?
+  
+  // AI Summary
+  aiSummary   String?
+  topFixes    Json?
+  
+  // Relations
+  userId      String
+  user        User        @relation(fields: [userId], references: [id])
+  
+  orgId       String
+  org         Organization @relation(fields: [orgId], references: [id])
+  
+  clientId    String?
+  client      Client?     @relation(fields: [clientId], references: [id])
+  
+  // Widget tracking
+  widgetId    String?
+  leadEmail   String?
+  leadName    String?
+  
+  createdAt   DateTime    @default(now())
+  completedAt DateTime?
+
+  @@index([userId])
+  @@index([orgId])
+  @@index([status])
+  @@index([createdAt])
+}
+
+// ============================================
+// CLIENTS (Agency clients)
+// ============================================
+
+model Client {
+  id            String   @id @default(uuid())
+  name          String
+  email         String
+  company       String?
+  phone         String?
+  
+  // Portal access
+  portalEnabled Boolean  @default(false)
+  portalPassword String?
+  
+  orgId         String
+  org           Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  
+  audits        Audit[]
+  
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@unique([email, orgId])
+  @@index([orgId])
+}
+
+// ============================================
+// WIDGET
+// ============================================
+
+model WidgetConfig {
+  id              String   @id @default(uuid())
+  name            String
+  isActive        Boolean  @default(true)
+  
+  // Styling
+  primaryColor    String   @default("#3B82F6")
+  buttonText      String   @default("Get Free SEO Audit")
+  successMessage  String   @default("Your audit is being generated!")
+  
+  // Behavior
+  requireEmail    Boolean  @default(true)
+  requireName     Boolean  @default(false)
+  webhookUrl      String?
+  
+  // Lead capture
+  leads           Json     @default("[]")
+  
+  orgId           String
+  org             Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@index([orgId])
+}
+
+// ============================================
+// BILLING
+// ============================================
+
+model Subscription {
+  id                   String   @id @default(uuid())
+  stripeCustomerId     String   @unique
+  stripeSubscriptionId String?  @unique
+  stripePriceId        String?
+  
+  status               String   @default("inactive")
+  currentPeriodStart   DateTime?
+  currentPeriodEnd     DateTime?
+  cancelAtPeriodEnd    Boolean  @default(false)
+  
+  orgId                String   @unique
+  org                  Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
+}
+
+model Payment {
+  id              String   @id @default(uuid())
+  stripePaymentId String   @unique
+  amount          Int
+  currency        String   @default("usd")
+  status          String
+  
+  orgId           String
+  
+  createdAt       DateTime @default(now())
+
+  @@index([orgId])
+}
+
+// ============================================
+// SECURITY
+// ============================================
+
+model BannedIP {
+  id        String    @id @default(uuid())
+  ip        String    @unique
+  reason    String
+  expiresAt DateTime?
+  createdAt DateTime  @default(now())
+
+  @@index([ip])
+}
+
+model LoginAttempt {
+  id        String   @id @default(uuid())
+  ip        String
+  email     String
+  success   Boolean
+  createdAt DateTime @default(now())
+
+  @@index([ip])
+  @@index([email])
+  @@index([createdAt])
+}
+
+// ============================================
+// AUDIT LOGS
+// ============================================
+
+model AuditLog {
+  id        String   @id @default(uuid())
+  action    String
+  entity    String
+  entityId  String?
+  userId    String?
+  orgId     String?
+  metadata  Json?
+  ip        String?
+  userAgent String?
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+  @@index([orgId])
+  @@index([action])
+  @@index([createdAt])
+}
