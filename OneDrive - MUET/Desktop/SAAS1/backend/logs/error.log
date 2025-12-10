@@ -1,3 +1,0 @@
-2025-12-09 14:25:24 [error]: Error: Invalid email or password
-    at Object.login (C:\Users\Admin\OneDrive - MUET\Desktop\SAAS1\backend\src\services\auth.service.ts:114:15)
-    at async <anonymous> (C:\Users\Admin\OneDrive - MUET\Desktop\SAAS1\backend\src\routes\auth.routes.ts:48:24)
